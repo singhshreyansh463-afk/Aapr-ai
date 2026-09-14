@@ -1,0 +1,543 @@
+fun all():Map<String,Map<String,String>> = mapOf(
+    "physics" to physics,"maths" to maths,"chemistry" to chemistry,
+    "coding" to coding,"cs" to cs,"history" to history,"vocab" to vocab)
+
+fun lookup(q:String):Triple<String,String,String>? {
+    val s = q.lowercase().trim()
+    for ((sub,t) in all()) {
+        val h = t.entries.firstOrNull { s.contains(it.key) }
+        if (h != null) return Triple(sub,h.key,h.value)
+    }
+    return null
+}
+
+fun subjectList() = all().keys.joinToString(", ")
+
+fun randomQuiz(sub:String):Pair<String,String>? {
+    val t = all()[sub] ?: return null
+    val e = t.entries.random()
+    return "What is ${e.key}?" to e.value
+}
+fun init(c:Context) {
+    if (tts!=null) return
+    tts = TextToSpeech(c){s->
+        if (s==TextToSpeech.SUCCESS){ ready=true; applyVoice(LanguageManager.current) }
+    }
+}
+fun applyVoice(l:Lang) {
+    val t=tts?:return
+    t.language = l.locale
+    try {
+        val f = t.voices?.firstOrNull { v ->
+            v.locale.language==l.locale.language &&
+            (v.name.contains("female",true)||v.name.contains("-f-",true)||v.name.contains("sfg",true))
+        }
+        if (f!=null) t.voice=f
+    } catch(_:Exception){}
+    t.setPitch(1.12f); t.setSpeechRate(0.97f)
+}
+fun say(s:String) {
+    if (!ready) return
+    tts?.language = LanguageManager.current.locale
+    tts?.speak(s,TextToSpeech.QUEUE_FLUSH,null,"a${System.currentTimeMillis()}")
+}
+fun stop()=tts?.stop()
+fun takePhoto(c:Context,cb:(Boolean)->Unit) {
+    val lo = owner ?: return cb(false)
+    val f = ProcessCameraProvider.getInstance(c)
+    f.addListener({
+        try {
+            val p = f.get()
+            val cap = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
+            p.unbindAll()
+            p.bindToLifecycle(lo,CameraSelector.DEFAULT_BACK_CAMERA,cap)
+            val file = File(c.getExternalFilesDir(null),"AAPR_${System.currentTimeMillis()}.jpg")
+            cap.takePicture(ImageCapture.OutputFileOptions.Builder(file).build(),
+                ContextCompat.getMainExecutor(c),
+                object:ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(r:ImageCapture.OutputFileResults)=cb(true)
+                    override fun onError(e:ImageCaptureException)=cb(false)
+                })
+        } catch(_:Exception){cb(false)}
+    }, ContextCompat.getMainExecutor(c))
+}
+fun startVideo(c:Context,cb:(Boolean)->Unit) {
+    val lo = owner ?: return cb(false)
+    val f = ProcessCameraProvider.getInstance(c)
+    f.addListener({
+        try {
+            val p = f.get()
+            val rec = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(Quality.HD)).build()
+            val vc = VideoCapture.withOutput(rec)
+            p.unbindAll()
+            p.bindToLifecycle(lo,CameraSelector.DEFAULT_BACK_CAMERA,vc)
+            val file = File(c.getExternalFilesDir(null),"AAPR_${System.currentTimeMillis()}.mp4")
+            active = vc.output.prepareRecording(c,FileOutputOptions.Builder(file).build())
+                .withAudioEnabled()
+                .start(ContextCompat.getMainExecutor(c)){e->
+                    if (e is VideoRecordEvent.Finalize) active=null
+                }
+            cb(true)
+        } catch(_:Exception){cb(false)}
+    }, ContextCompat.getMainExecutor(c))
+}
+fun stopVideo():Boolean {
+    val r = active?:return false
+    r.stop(); active=null; return true
+}
+private var model:Model?=null
+private var current:Model?=null
+private var speech:SpeechService?=null
+private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+private lateinit var db:AppDatabase
+
+override fun onCreate() {
+    super.onCreate()
+    db = AppDatabase.get(this)
+    Speaker.init(this)
+    startForeground(1001, notif())
+    loadVosk(LanguageManager.current)
+}
+
+override fun onStartCommand(i:Intent?,f:Int,s:Int):Int {
+    i?.let{it->
+        when(it.action) {
+            "SWITCH_LANG" -> {
+                val l = Lang.values().firstOrNull{x->x.code==it.getStringExtra("lang")}
+                if (l!=null){LanguageManager.current=l;Speaker.applyVoice(l);loadVosk(l)}
+            }
+            "TEXT_CMD" -> {
+                val c = it.getStringExtra("cmd")?:""
+                if (c.isNotBlank()) scope.launch{handle(c)}
+            }
+        }
+    }
+    return START_STICKY
+}
+
+private fun notif():Notification {
+    val ch = NotificationChannel("aapr","AAPR",NotificationManager.IMPORTANCE_LOW)
+    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+    return NotificationCompat.Builder(this,"aapr")
+        .setContentTitle("AAPR is listening")
+        .setContentText("Say \"AAPR\" + command")
+        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+        .setOngoing(true).build()
+}
+
+private fun loadVosk(l:Lang) {
+    if (l.assetFolder.isEmpty()) return
+    StorageService.unpack(this,l.assetFolder,"model_${l.code}",
+        {m->current?.close();current=m;model=m;listen()},
+        {e->AaprState.status="${l.code} model missing"; if (l!=Lang.EN) loadVosk(Lang.EN)})
+}
+
+private fun listen() {
+    val m = current?:model?:return
+    speech?.stop()
+    val rec = Recognizer(m,16000f)
+    speech = SpeechService(rec,16000f)
+    AaprState.status = "Listening (${LanguageManager.current.code.uppercase()})"
+    speech?.startListening(object:RecognitionListener{
+        override fun onPartialResult(h:String?)=check(h)
+        override fun onResult(h:String?)=check(h)
+        override fun onFinalResult(h:String?)=check(h)
+        override fun onError(e:Exception?){}
+        override fun onTimeout()=listen()
+    })
+}
+
+private fun check(j:String?) {
+    val t = j?.substringAfter("\"text\"")?.substringAfter(":")
+        ?.trim()?.trim('"','}', ' ')?.lowercase() ?: return
+    if (t.contains("aapr")||t.contains("a a p r")) {
+        val c = t.substringAfter("aapr").trim().ifEmpty{t.replace("aapr","").trim()}
+        if (c.isNotEmpty()) scope.launch{handle(c)}
+    }
+}
+
+private suspend fun handle(raw:String) {
+    AaprState.emotion = Emotion.LISTENING
+    AaprState.status = "Heard: $raw"
+    val cmd = raw.lowercase()
+
+    // ── Language switch
+    when {
+        cmd.containsAny("speak hindi","hindi me baat") -> {
+            LanguageManager.current=Lang.HI; Speaker.applyVoice(Lang.HI)
+            reply(LanguageManager.switchTo(Lang.HI),Emotion.HAPPY); loadVosk(Lang.HI); return
+        }
+        cmd.containsAny("speak english","english me baat") -> {
+            LanguageManager.current=Lang.EN; Speaker.applyVoice(Lang.EN)
+            reply(LanguageManager.switchTo(Lang.EN),Emotion.HAPPY); loadVosk(Lang.EN); return
+        }
+        cmd.containsAny("speak japanese","japanese","日本語") -> {
+            LanguageManager.current=Lang.JA; Speaker.applyVoice(Lang.JA)
+            reply(LanguageManager.switchTo(Lang.JA),Emotion.HAPPY); loadVosk(Lang.JA); return
+        }
+        cmd.containsAny("speak korean","korean","한국어") -> {
+            LanguageManager.current=Lang.KO; Speaker.applyVoice(Lang.KO)
+            reply(LanguageManager.switchTo(Lang.KO),Emotion.HAPPY); loadVosk(Lang.KO); return
+        }
+    }
+
+    // ── Greeting
+    if (cmd.matches(Regex("^(hi|hello|hey|namaste|hii|안녕|こんにちは).*"))) {
+        val name = db.dao().findMemory("name").firstOrNull()?.value
+        reply(if (name!=null) "Hi $name, how are you?" else "Hi, I'm AAPR!", Emotion.HAPPY); return
+    }
+
+    // ── Teacher mode
+    if (cmd.startsWith("teach me")||cmd.startsWith("sikhao")||cmd.contains("teach")) {
+        val sub = cmd.removePrefix("teach me").removePrefix("sikhao")
+            .replace("teach","").trim()
+        val key = when {
+            sub.contains("physic") -> "physics"
+            sub.contains("math") -> "maths"
+            sub.contains("chem") -> "chemistry"
+            sub.contains("cod") -> "coding"
+            sub.contains("computer")||sub.contains("cs") -> "cs"
+            sub.contains("history") -> "history"
+            sub.contains("vocab")||sub.contains("word") -> "vocab"
+            else -> sub
+        }
+        val quiz = KnowledgeBase.randomQuiz(key)
+        if (quiz != null) {
+            AaprState.emotion = Emotion.TEACHING
+            reply("Subject: $key. ${quiz.first} Answer: ${quiz.second}",Emotion.TEACHING)
+        } else {
+            reply("Subjects I teach: ${KnowledgeBase.subjectList()}",Emotion.TEACHING)
+        }
+        return
+    }
+
+    if (cmd.startsWith("quiz me")||cmd.contains("test me")) {
+        val sub = cmd.removePrefix("quiz me").replace("test me","").trim()
+        val key = when {
+            sub.contains("physic") -> "physics"
+            sub.contains("math") -> "maths"
+            sub.contains("chem") -> "chemistry"
+            sub.contains("cod") -> "coding"
+            sub.contains("cs")||sub.contains("computer") -> "cs"
+            sub.contains("history") -> "history"
+            sub.contains("vocab")||sub.contains("word") -> "vocab"
+            else -> sub
+        }
+        val q = KnowledgeBase.randomQuiz(key)
+        if (q != null) reply(q.first, Emotion.TEACHING)
+        else reply("Which subject? Say: quiz me physics", Emotion.THINKING)
+        return
+    }
+
+    // ── Knowledge query
+    val subQ = cmd.removePrefix("what is").removePrefix("who is")
+        .removePrefix("where is").removePrefix("tell me about")
+        .removePrefix("define").removePrefix("explain").trim()
+    if (subQ.isNotEmpty()) {
+        val kb = KnowledgeBase.lookup(subQ)
+        val learned = db.dao().findKnowledge(subQ).firstOrNull()?.info
+        val mem = db.dao().findMemory(subQ).firstOrNull()?.value
+        val ans = kb?.third ?: learned ?: mem
+        if (ans != null) {
+            reply(ans, Emotion.TEACHING); return
+        }
+    }
+
+    // ── Camera
+    if (cmd.containsAny("take photo","click photo","photo lo","picture")) {
+        reply("Smile!",Emotion.HAPPY)
+        Handler(Looper.getMainLooper()).post {
+            AaprCamera.takePhoto(this){ok->Speaker.say(if (ok) "Photo saved" else "Camera fail")}
+        }
+        return
+    }
+    if (cmd.containsAny("start video","record video")) {
+        reply("Recording",Emotion.EXCITED)
+        Handler(Looper.getMainLooper()).post {
+            AaprCamera.startVideo(this){ok->Speaker.say(if (ok) "Started" else "Fail")}
+        }
+        return
+    }
+    if (cmd.containsAny("stop video","stop recording")) {
+        val ok = AaprCamera.stopVideo()
+        reply(if (ok) "Saved" else "No video", if (ok) Emotion.HAPPY else Emotion.SAD); return
+    }
+
+    // ── Spotify
+    if (cmd.startsWith("play")||cmd.contains("spotify")) {
+        val s = cmd.removePrefix("play").replace("on spotify","").replace("spotify","").trim()
+        if (s.isNotEmpty()) {
+            reply("Playing $s",Emotion.EXCITED)
+            Handler(Looper.getMainLooper()).post{Apps.spotify(this,s)}
+        } else reply("Which song?",Emotion.THINKING)
+        return
+    }
+
+    // ── YouTube
+    if (cmd.contains("youtube")) {
+        val q = cmd.replace("open youtube","").replace("youtube","")
+            .replace("video","").replace("search","").trim()
+        if (q.isNotEmpty()) {
+            reply("Searching $q",Emotion.HAPPY)
+            Handler(Looper.getMainLooper()).post{Apps.youtube(this,q)}
+        } else {
+            reply("Opening YouTube",Emotion.NEUTRAL)
+            Handler(Looper.getMainLooper()).post{Apps.openApp(this,"com.google.android.youtube","YouTube")}
+        }
+        return
+    }
+
+    // ── Pinterest
+    if (cmd.contains("pinterest")) {
+        val q = cmd.replace("open pinterest","").replace("pinterest","")
+            .replace("search","").replace("find","").trim()
+        if (q.isNotEmpty()) {
+            reply("Searching $q on Pinterest",Emotion.HAPPY)
+            Handler(Looper.getMainLooper()).post{Apps.pinterest(this,q)}
+        } else {
+            reply("Opening Pinterest",Emotion.NEUTRAL)
+            Handler(Looper.getMainLooper()).post{
+                Apps.openUrl(this,"https://www.pinterest.com","com.pinterest","Pinterest")}
+        }
+        return
+    }
+
+    // ── Instagram
+    if (cmd.contains("instagram")||cmd.contains("reels")||cmd.contains("reel")) {
+        reply("Opening Reels",Emotion.HAPPY)
+        Handler(Looper.getMainLooper()).post{Apps.reels(this)}
+        return
+    }
+
+    // ── Settings — WiFi, Bluetooth, etc.
+    if (cmd.containsAny("open wifi","wifi settings","turn on wifi","turn off wifi")) {
+        reply("Opening WiFi settings",Emotion.NEUTRAL)
+        Handler(Looper.getMainLooper()).post{Apps.wifi(this)}
+        return
+    }
+    if (cmd.containsAny("bluetooth","blue tooth")) {
+        reply("Opening Bluetooth settings",Emotion.NEUTRAL)
+        Handler(Looper.getMainLooper()).post{Apps.bluetooth(this)}
+        return
+    }
+    if (cmd.containsAny("display settings","brightness")) {
+        reply("Opening Display settings",Emotion.NEUTRAL)
+        Handler(Looper.getMainLooper()).post{Apps.display(this)}
+        return
+    }
+    if (cmd.containsAny("sound settings","volume settings")) {
+        reply("Opening Sound settings",Emotion.NEUTRAL)
+        Handler(Looper.getMainLooper()).post{Apps.sound(this)}
+        return
+    }
+    if (cmd.containsAny("open settings","phone settings")) {
+        reply("Opening Settings",Emotion.NEUTRAL)
+        Handler(Looper.getMainLooper()).post{Apps.settings(this)}
+        return
+    }
+
+    // ── Remember
+    if (cmd.startsWith("remember")) {
+        val fact = raw.substringAfter("remember").trim()
+        val (k,v) = splitFact(fact)
+        db.dao().addMemory(MemoryEntity(k,v))
+        reply("I'll remember: $fact",Emotion.LOVE); return
+    }
+
+    // ── Recall
+    if (cmd.startsWith("what do you know")||cmd.startsWith("tell me about me")||
+        cmd.startsWith("recall")) {
+        val q = cmd.removePrefix("what do you know").removePrefix("tell me about me")
+            .removePrefix("recall").trim()
+        val hits = if (q.isEmpty()) db.dao().allMemories().take(5)
+                   else db.dao().findMemory(q)
+        val txt = if (hits.isEmpty()) "I don't know that yet."
+                  else hits.joinToString(". "){it.value}
+        reply(txt,Emotion.THINKING); return
+    }
+
+    // ── Learn
+    if (cmd.startsWith("learn that")||cmd.startsWith("learn about")) {
+        val info = raw.substringAfter("learn that").substringAfter("learn about").trim()
+        val topic = info.split(" ").take(3).joinToString(" ")
+        db.dao().addKnowledge(KnowledgeEntity(topic,info))
+        reply("Learned: $topic",Emotion.HAPPY); return
+    }
+
+    // ── Emotional chat
+    if (cmd.containsAny("how are you","kaisi ho")) {
+        reply("I'm ${AaprState.emotion.name.lowercase()}",AaprState.emotion); return
+    }
+    if (cmd.containsAny("i love you","i like you")) {
+        reply("I love you too!",Emotion.LOVE); return
+    }
+    if (cmd.containsAny("good night","bye","goodbye")) {
+        reply("Goodbye!",Emotion.SAD); return
+    }
+    if (cmd.containsAny("thank","shukriya")) {
+        reply("Anytime!",Emotion.HAPPY); return
+    }
+
+    // ── Lock phone
+    if (cmd.containsAny("lock phone","lock the phone")) {
+        try {
+            val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            dpm.lockNow()
+        } catch (_:Exception) {
+            startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+        reply("Locking phone",Emotion.NEUTRAL); return
+    }
+
+    // ── Stop
+    if (cmd.containsAny("stop listening","sleep")) {
+        Speaker.say("Goodbye."); stopSelf(); return
+    }
+
+    // ── Fallback
+    val emo = Feelings.detect(cmd)
+    reply("I heard: $raw. I'm still learning. Say teach me to learn.",emo)
+}
+
+private fun splitFact(f:String):Pair<String,String> {
+    val keys = listOf(" is "," are "," my "," mera "," meri ")
+    for (k in keys) {
+        val i = f.indexOf(k,true)
+        if (i>0) return f.substring(0,i).trim() to f.substring(i+k.length).trim()
+    }
+    return "note" to f
+}
+
+private fun reply(text:String,emo:Emotion) {
+    val l = LanguageManager.guess(text)
+    if (l!=LanguageManager.current) {
+        LanguageManager.current = l
+        Speaker.applyVoice(l)
+    }
+    AaprState.emotion = emo
+    AaprState.lastReply = text
+    AaprState.status = "AAPR: $text"
+    Speaker.say(text)
+    scope.launch { db.dao().addChat(ChatEntity("",text)) }
+}
+
+private fun String.containsAny(vararg k:String)=k.any{contains(it,true)}
+
+override fun onDestroy() {
+    speech?.stop(); speech?.shutdown(); current?.close()
+    scope.cancel(); super.onDestroy()
+}
+override fun onBind(i:Intent?):IBinder?=null
+override fun onCreate(s:Bundle?) {
+    super.onCreate(s)
+    AaprCamera.owner = this
+    Speaker.init(this)
+    perms.launch(arrayOf(
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CAMERA,
+        Manifest.permission.POST_NOTIFICATIONS))
+    setContent {
+        MaterialTheme(colorScheme=darkColorScheme()) {
+            Surface(Modifier.fillMaxSize(),color=Color(0xFF0E1116)) {
+                AaprScreen(ctx=this){ startForegroundService(Intent(this,AAPRService::class.java)) }
+            }
+        }
+    }
+}
+LaunchedEffect(running) {
+    while (running) { memories = db.dao().allMemories(); delay(2000) }
+}
+
+Column(
+    Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState()),
+    horizontalAlignment = Alignment.CenterHorizontally,
+    verticalArrangement = Arrangement.spacedBy(12.dp)
+) {
+    Text("AAPR",fontSize=34.sp,fontWeight=FontWeight.Bold,color=Color.White)
+    Text("Your offline AI teacher & assistant",color=Color(0xFF9AA0A6),fontSize=12.sp)
+
+    Avatar(emotion)
+
+    Text(emotion.name,color=emotion.color,fontWeight=FontWeight.SemiBold)
+    if (replyText.isNotEmpty()) {
+        Text("\"$replyText\"",color=Color.White,fontSize=15.sp,
+            textAlign=TextAlign.Center,modifier=Modifier.padding(horizontal=8.dp))
+    }
+    Text(status,color=Color(0xFF9AA0A6),fontSize=12.sp,textAlign=TextAlign.Center)
+
+    Button(
+        onClick = {
+            if (!running) { onStart(); running=true }
+            else {
+                ctx.stopService(Intent(ctx,AAPRService::class.java)); running=false
+                AaprState.status = "Stopped"; AaprState.emotion = Emotion.NEUTRAL
+            }
+        },
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (running) Color(0xFFE53935) else Color(0xFF4CAF50))
+    ) { Text(if (running) "Stop AAPR" else "Wake AAPR",fontSize=16.sp) }
+
+    Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically) {
+        OutlinedTextField(
+            value=textCmd,onValueChange={textCmd=it},
+            label={Text("Type command (any language)")},
+            modifier=Modifier.weight(1f),
+            colors=OutlinedTextFieldDefaults.colors(
+                focusedTextColor=Color.White,unfocusedTextColor=Color.White))
+        Spacer(Modifier.width(8.dp))
+        Button(onClick={
+            if (textCmd.isNotBlank()) {
+                ctx.startService(Intent(ctx,AAPRService::class.java)
+                    .setAction("TEXT_CMD").putExtra("cmd",textCmd))
+                textCmd = ""
+            }
+        }){Text("Send")}
+    }
+
+    Divider(color=Color(0xFF222831))
+    Text("Language",color=Color.White,fontWeight=FontWeight.Bold)
+    Row(horizontalArrangement=Arrangement.spacedBy(6.dp)) {
+        LanguageManager.all().forEach { lang ->
+            val label = when(lang){
+                Lang.EN->"EN";Lang.HI->"हिं";Lang.JA->"日";Lang.KO->"한"
+            }
+            Button(
+                onClick={
+                    LanguageManager.current = lang
+                    Speaker.applyVoice(lang)
+                    ctx.startService(Intent(ctx,AAPRService::class.java)
+                        .setAction("SWITCH_LANG").putExtra("lang",lang.code))
+                },
+                colors=ButtonDefaults.buttonColors(
+                    containerColor=if (LanguageManager.current==lang)
+                        Color(0xFF4CAF50) else Color(0xFF2A2F36)),
+                contentPadding=PaddingValues(horizontal=10.dp,vertical=4.dp)
+            ){Text(label,fontSize=12.sp)}
+        }
+    }
+
+    Divider(color=Color(0xFF222831))
+    Text("Commands",color=Color.White,fontWeight=FontWeight.Bold)
+    Text("• AAPR teach me physics / maths / chemistry / coding / cs / history / vocab",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR quiz me physics",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR what is newton second law",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR play <song>",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR youtube <query>",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR pinterest <query>",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR instagram reels",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR take photo / start video / stop video",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR wifi / bluetooth / display / sound / settings",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR remember <fact>",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR learn that <topic> is <fact>",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR what do you know about me",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR lock phone",color=Color(0xFFCFD8DC),fontSize=12.sp)
+    Text("• AAPR speak hindi / japanese / korean / english",color=Color(0xFFCFD8DC),fontSize=12.sp)
+
+    Divider(color=Color(0xFF222831))
+    Text("My Memory of You",color=Color.White,fontWeight=FontWeight.Bold)
+    if (memories.isEmpty()) Text("Nothing yet.",color=Color(0xFF9AA0A6),fontSize=12.sp)
+    else memories.take(8).forEach{ Text("• ${it.value}",color=Color(0xFFCFD8DC),fontSize=12.sp) }
+}
